@@ -18,6 +18,7 @@ from rclpy.action import ActionClient
 from nav2_msgs.action import NavigateToPose
 from std_msgs.msg import Empty
 from std_msgs.msg import Float32
+from std_msgs.msg import Bool
 from rcl_interfaces.srv import SetParameters
 import threading
 import sys
@@ -44,7 +45,7 @@ class Nav2WaypointManager(Node):
 
         self.use_gnss_switch_flg = self.get_parameter("use_gnss_switch").value
         self.cmd_vel_topic = self.declare_parameter("cmd_vel_topic", "/cmd_vel").value
-        self.initialize_cmd_vel_linear_x = self.declare_parameter("initialize_cmd_vel_linear_x", 0.1).value
+        self.initialize_cmd_vel_linear_x = self.declare_parameter("initialize_cmd_vel_linear_x", 0.3).value
         self.initialize_radius = self.declare_parameter("initialize_radius", 3.0).value
 
         self.waypoints = []
@@ -82,6 +83,9 @@ class Nav2WaypointManager(Node):
         self.stop_command_pub = self.create_publisher(Empty, '/wizurg/stop_cmd_vel', 10)
         self.start_command_pub = self.create_publisher(Empty, '/wizurg/start_cmd_vel', 10)
         self.slow_command_pub = self.create_publisher(Float32, '/wizurg/slow_cmd_vel', 10)
+        # pass_through 区間 (次のウェイポイントまで) の間、obstacle_monitor に経路付近の障害物を無視させる.
+        # レベル方式で出し続け、途絶えると obstacle_monitor 側で自動的に解除される.
+        self.pass_through_pub = self.create_publisher(Bool, '/wizurg/pass_through', 10)
         self.skip_command_sub = self.create_subscription(Empty, '/skip_waypoint', self.skip_command_callback, 10)
 
         self.load_waypoints_from_json()
@@ -92,6 +96,9 @@ class Nav2WaypointManager(Node):
 
     def reset_attribute_state(self):
         self.start_command_pub.publish(Empty())
+        if self.current_attr_type == "pass_through":
+            self.pass_through_pub.publish(Bool(data=False))
+            self.get_logger().info("pass_through segment finished.")
         self.current_attr_type = "normal"
         self.current_attr_value = 0
         self.last_attr_time = self.get_clock().now()
@@ -118,6 +125,13 @@ class Nav2WaypointManager(Node):
                     attribute = item[2] if len(item) > 2 else {"type": "normal", "value": 0, "xy_tolerance": 1.0, "yaw_tolerance": 3.14}
                     attribute["xy_tolerance"] = attribute.get("xy_tolerance", 1.0)
                     attribute["yaw_tolerance"] = attribute.get("yaw_tolerance", 3.14)
+                    # GUI などで数値が文字列 ("0.2") で保存されることがあるため数値に直す
+                    for key in ("value", "xy_tolerance", "yaw_tolerance"):
+                        try:
+                            attribute[key] = float(attribute.get(key, 0))
+                        except (TypeError, ValueError):
+                            self.get_logger().warn(f"waypoint {len(self.attributes)}: invalid {key}={attribute.get(key)!r}, using 0")
+                            attribute[key] = 0.0
                     self.attributes.append(attribute)
 
             self.get_logger().info(f"Loaded {len(self.waypoints)} waypoints from {self.filename}")
@@ -379,6 +393,8 @@ class Nav2WaypointManager(Node):
             if time_diff.nanoseconds / 1e9 > self.current_attr_value:
                 self.reset_attribute_state()
                 self.get_logger().info("Stop duration completed. Resuming navigation.")
+        elif self.current_attr_type == "pass_through":
+            self.pass_through_pub.publish(Bool(data=True))
 
     def main_loop(self):
         """メインループ (カスタムの到着判定ロジックを実行)"""
@@ -548,6 +564,20 @@ class Nav2WaypointManager(Node):
             self.last_attr_time = self.get_clock().now()
             self.current_attr_value = attr_value
             self.curent_attr_type = "slow"
+
+        elif attr_type == "pass_through":
+            # 次のウェイポイントまで経路付近の障害物 (通路に張り出した枝葉など) を無視し、value m/s で徐行する.
+            # 区間内では経路上の人も無視されるため、使う区間は最小限にすること.
+            self.get_logger().info(f"pass_through: ignoring obstacles near the path at {attr_value} m/s until next waypoint.")
+            # value が 0 以下だと cmdvel_stopper が 0 m/s に制限して動けなくなるため、その場合は速度制限しない
+            if float(attr_value) > 0.0:
+                msg = Float32()
+                msg.data = float(attr_value)
+                self.slow_command_pub.publish(msg)
+            self.pass_through_pub.publish(Bool(data=True))
+            self.last_attr_time = self.get_clock().now()
+            self.current_attr_value = attr_value
+            self.current_attr_type = "pass_through"
 
         elif attr_type == "normal":
             # param = rclpy.parameter.Parameter('max_speed_xy', rclpy.Parameter.Type.DOUBLE, self.original_speed)
