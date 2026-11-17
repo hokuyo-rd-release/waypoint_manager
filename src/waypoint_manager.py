@@ -87,6 +87,8 @@ class Nav2WaypointManager(Node):
         # レベル方式で出し続け、途絶えると obstacle_monitor 側で自動的に解除される.
         self.pass_through_pub = self.create_publisher(Bool, '/wizurg/pass_through', 10)
         self.skip_command_sub = self.create_subscription(Empty, '/skip_waypoint', self.skip_command_callback, 10)
+        # wait 属性のウェイポイントで停止中に受け取ると、停止を解除して次のウェイポイントへ進む
+        self.start_waypoint_sub = self.create_subscription(Empty, '/start_waypoint', self.start_waypoint_callback, 10)
 
         self.load_waypoints_from_json()
         self.wait_for_stable_odometry_switch_type()
@@ -238,6 +240,9 @@ class Nav2WaypointManager(Node):
                 elif attr_type == "slow":
                     value_display = f"{attr_value:.2f}"
                     unit = "[m/s]"
+
+                elif attr_type == "wait":
+                    value_display = "until /start_waypoint"
                 
                 # 'normal' 属性の場合は、元の速度と単位を表示
                 if attr_type == "normal":
@@ -346,6 +351,14 @@ class Nav2WaypointManager(Node):
             self.get_logger().info("Skip command received. Skipping current waypoint.")
             self.skip_current_waypoint()
 
+    def start_waypoint_callback(self, msg):
+        # wait 中以外に届いた start は無視する (到着前に押された start で素通りしないように)
+        if self.current_attr_type == "wait":
+            self.get_logger().info("Start command received. Resuming navigation to the next waypoint.")
+            self.reset_attribute_state()
+        else:
+            self.get_logger().info("Start command received but not waiting at a waypoint. Ignored.")
+
     def skip_current_waypoint(self):
         # マーカー削除
         delete_marker = Marker()
@@ -399,6 +412,13 @@ class Nav2WaypointManager(Node):
     def main_loop(self):
         """メインループ (カスタムの到着判定ロジックを実行)"""
         self.callback_behavior_timer()
+
+        # wait 属性で停止中は次のゴールを送らず、/start_waypoint を待つ
+        if self.current_attr_type == "wait":
+            self.get_logger().info(
+                f"Waiting at waypoint {self.last_waypoint_index}. Publish std_msgs/Empty to /start_waypoint to resume.",
+                throttle_duration_sec=5.0)
+            return
 
         # --- 現在の目標ウェイポイントマーカーの更新 ---
         if self.is_navigating and self.current_waypoint_index < len(self.waypoints):
@@ -554,6 +574,14 @@ class Nav2WaypointManager(Node):
             self.last_attr_time = self.get_clock().now()
             self.current_attr_value = attr_value
             self.current_attr_type = "stop"
+
+        elif attr_type == "wait":
+            # 停止したまま待機し、/start_waypoint を受けたら次のウェイポイントへ進む (value は使わない)
+            self.get_logger().info("Waiting for start command on /start_waypoint...")
+            self.stop_command_pub.publish(Empty())
+            self.last_attr_time = self.get_clock().now()
+            self.current_attr_value = attr_value
+            self.current_attr_type = "wait"
 
         elif attr_type == "slow":
             self.get_logger().info(f"Setting max_speed_xy to {attr_value} m/s.")

@@ -43,8 +43,8 @@ colcon build --packages-select waypoint_manager
   [position_x, position_y, position_z],
   [orientation_x, orientation_y, orientation_z, orientation_w],
   {
-    "type": "normal",      // 属性タイプ ("normal", "stop", "slow")
-    "value": 0,            // 属性の値 (停止時間[s] や 制限速度[m/s])
+    "type": "normal",      // 属性タイプ ("normal", "stop", "slow", "pass_through", "wait")
+    "value": 0,            // 属性の値 (停止時間[s] や 制限速度[m/s]。"wait" では未使用)
     "xy_tolerance": 0.25,  // 到着判定の距離許容誤差 [m]
     "yaw_tolerance": 0.25  // 到着判定の角度許容誤差 [rad]
   }
@@ -77,7 +77,7 @@ Nav2のアクションクライアントとして動作し、ウェイポイン�
 | `waypoint_marker_array` | `visualization_msgs/MarkerArray` | ウェイポイントの詳細情報（矢印、属性テキスト）の可視化用。 |
 | `current_goal_marker` | `visualization_msgs/Marker` | 現在目指しているウェイポイントの可視化用。 |
 | `cmd_vel_topic` | `geometry_msgs/Twist` | `use_gnss_switch` 有効時の初期化動作指令。 |
-| `/wizurg/stop_cmd_vel` | `std_msgs/Empty` | 停止指令（属性 `stop` 時など）。 |
+| `/wizurg/stop_cmd_vel` | `std_msgs/Empty` | 停止指令（属性 `stop` / `wait` 時など）。 |
 | `/wizurg/start_cmd_vel` | `std_msgs/Empty` | 再開指令（属性 `normal` 時など）。 |
 | `/wizurg/slow_cmd_vel` | `std_msgs/Float32` | 減速指令（属性 `slow` 時）。 |
 
@@ -86,6 +86,8 @@ Nav2のアクションクライアントとして動作し、ウェイポイン�
 | トピック名 | 型 | 説明 |
 | --- | --- | --- |
 | `/rsf/rsf_odom_type` | `std_msgs/String` | オドメトリのスイッチタイプ監視用 (`use_gnss_switch` が True の場合)。 |
+| `/skip_waypoint` | `std_msgs/Empty` | 走行中に受け取ると、現在のウェイポイントをスキップする。 |
+| `/start_waypoint` | `std_msgs/Empty` | 属性 `wait` のウェイポイントで停止中に受け取ると、停止を解除して次のウェイポイントへ進む。停止中以外は無視する。 |
 
 #### アクションクライアント
 
@@ -101,6 +103,10 @@ Nav2のアクションクライアントとして動作し、ウェイポイン�
     - ウェイポイント通過判定（スキップ機能）を実装しており、経路上でウェイポイントを通り過ぎた場合、次のウェイポイントへ自動的に切り替えます。
 4.  **属性処理 (`process_waypoint_attribute`)**:
     - `stop`: 指定時間停止します。
+    - `wait`: 到着後に停止したまま待機し、`/start_waypoint` (`std_msgs/Empty`) を受け取ると次のウェイポイントへ進みます。待機中は次のゴールを Nav2 に送りません。
+      ```bash
+      ros2 topic pub --once /start_waypoint std_msgs/msg/Empty "{}"
+      ```
     - `slow`: 指定速度に減速します（`/wizurg/slow_cmd_vel` をPublish）。
     - `normal`: 通常速度に戻ります。
 
