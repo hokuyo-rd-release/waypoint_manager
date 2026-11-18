@@ -19,10 +19,19 @@ from nav2_msgs.action import NavigateToPose
 from std_msgs.msg import Empty
 from std_msgs.msg import Float32
 from std_msgs.msg import Bool
+from std_msgs.msg import Int32
 from rcl_interfaces.srv import SetParameters
 import threading
 import sys
 import argparse
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
+
+# lifetime=0 (無期限) を vizanti が即期限切れとして扱うため、十分長い有限値を使う
+MARKER_LIFETIME = DurationMsg(sec=86400)
+# 後から接続した RViz / vizanti にも最新のマーカーが届くように最後の1件を保持する
+LATCHED_QOS = QoSProfile(depth=1,
+                         durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                         reliability=ReliabilityPolicy.RELIABLE)
 
 class Nav2WaypointManager(Node):
     def __init__(self, filename, is_looping=True):
@@ -68,8 +77,13 @@ class Nav2WaypointManager(Node):
         self.navigation_start_time = None
 
         self.waypoint_pub = self.create_publisher(PoseArray, 'waypoints', 10)
-        self.marker_array_pub = self.create_publisher(MarkerArray, 'waypoint_marker_array', 10)
-        self.current_goal_marker_pub = self.create_publisher(Marker, 'current_goal_marker', 10)
+        self.marker_array_pub = self.create_publisher(MarkerArray, 'waypoint_marker_array', LATCHED_QOS)
+        # vizanti は MarkerArray のみ表示できるため MarkerArray で送る。目標が変わったときだけ publish する
+        self.current_goal_marker_pub = self.create_publisher(MarkerArray, 'current_goal_marker', LATCHED_QOS)
+        self.published_goal_index = None
+        # wait 属性で待機中のウェイポイント番号 (-1 = 待機していない)。RViz の開始ボタンパネルが使う
+        self.waiting_pub = self.create_publisher(Int32, 'waiting_waypoint', LATCHED_QOS)
+        self.waiting_pub.publish(Int32(data=-1))
 
 
         self.original_speed = self.declare_parameter('original_speed', 0.56).value
@@ -98,6 +112,8 @@ class Nav2WaypointManager(Node):
 
     def reset_attribute_state(self):
         self.start_command_pub.publish(Empty())
+        if self.current_attr_type == "wait":
+            self.waiting_pub.publish(Int32(data=-1))
         if self.current_attr_type == "pass_through":
             self.pass_through_pub.publish(Bool(data=False))
             self.get_logger().info("pass_through segment finished.")
@@ -179,6 +195,9 @@ class Nav2WaypointManager(Node):
             marker_array.markers.append(delete_marker)
 
             # 新しいマーカー（矢印とテキスト）を追加
+            # vizanti は受信順に描画するため、テキストを先・矢印を後に並べて矢印がテキストに隠れないようにする
+            arrow_markers = []
+            text_markers = []
             for i, pose_stamped in enumerate(self.waypoints):
                 # --- 矢印マーカーの作成 ---
                 arrow_marker = Marker()
@@ -190,14 +209,14 @@ class Nav2WaypointManager(Node):
                 arrow_marker.action = Marker.ADD
                 arrow_marker.pose = pose_stamped.pose
                 arrow_marker.scale.x = 1.0  # 矢印の長さ
-                arrow_marker.scale.y = 0.15 # 矢印の幅
-                arrow_marker.scale.z = 0.15 # 矢印の高さ
-                arrow_marker.color.a = 0.8
+                arrow_marker.scale.y = 0.25 # 矢印の幅
+                arrow_marker.scale.z = 0.25 # 矢印の高さ
+                arrow_marker.color.a = 1.0
                 arrow_marker.color.r = 0.0
                 arrow_marker.color.g = 1.0
                 arrow_marker.color.b = 0.0
-                arrow_marker.lifetime = DurationMsg()
-                marker_array.markers.append(arrow_marker)
+                arrow_marker.lifetime = MARKER_LIFETIME
+                arrow_markers.append(arrow_marker)
 
                 # --- テキストマーカーの作成 ---
                 text_marker = Marker()
@@ -211,11 +230,8 @@ class Nav2WaypointManager(Node):
                 text_marker.pose.position.y = pose_stamped.pose.position.y # Y座標
                 text_marker.pose.position.z = pose_stamped.pose.position.z + 0.5 # Z座標 + 0.5m (テキストが地面から浮くように)
                 
-                # ウェイポイントの向きを設定
-                text_marker.pose.orientation.x = pose_stamped.pose.orientation.x
-                text_marker.pose.orientation.y = pose_stamped.pose.orientation.y
-                text_marker.pose.orientation.z = pose_stamped.pose.orientation.z
-                text_marker.pose.orientation.w = pose_stamped.pose.orientation.w
+                # テキストは回転させない (RViz の TEXT_VIEW_FACING は向きを無視するが、vizanti は向きどおりに回転させて描画するため)
+                text_marker.pose.orientation.w = 1.0
                 
                 text_marker.scale.z = 0.5
                 text_marker.color.a = 1.0
@@ -256,15 +272,18 @@ class Nav2WaypointManager(Node):
                 qw = pose_stamped.pose.orientation.w
 
                 text_marker.text = (
+                    f"#{i}"
                     f"\nType:{attr_type}"
                     f"\nValue:{value_display}{unit}"
                     f"\nxy_tol:{xy_tolerance:.2f}[m]"
                     f"\nyaw_tol:{yaw_tolerance:.2f}[rad]"
                 )
 
-                text_marker.lifetime = DurationMsg()
-                marker_array.markers.append(text_marker)
+                text_marker.lifetime = MARKER_LIFETIME
+                text_markers.append(text_marker)
 
+            marker_array.markers.extend(text_markers)
+            marker_array.markers.extend(arrow_markers)
             self.marker_array_pub.publish(marker_array)
 
     def wait_for_stable_odometry_switch_type(self):
@@ -361,12 +380,7 @@ class Nav2WaypointManager(Node):
 
     def skip_current_waypoint(self):
         # マーカー削除
-        delete_marker = Marker()
-        delete_marker.header.frame_id = "map"
-        delete_marker.ns = "current_goal"
-        delete_marker.id = 0
-        delete_marker.action = Marker.DELETE
-        self.current_goal_marker_pub.publish(delete_marker)
+        self.delete_current_goal_marker()
 
         self.is_navigating = False
         self.arrival_check_count = 0
@@ -409,6 +423,36 @@ class Nav2WaypointManager(Node):
         elif self.current_attr_type == "pass_through":
             self.pass_through_pub.publish(Bool(data=True))
 
+    def publish_current_goal_marker(self, index):
+        marker = Marker()
+        marker.header.frame_id = "map"
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = "current_goal"
+        marker.id = 0
+        marker.type = Marker.ARROW
+        marker.action = Marker.ADD
+        marker.pose = self.waypoints[index].pose
+        marker.scale.x = 1.5  # 矢印の長さ
+        marker.scale.y = 0.3  # 矢印の幅
+        marker.scale.z = 0.3  # 矢印の高さ
+        marker.color.a = 1.0
+        marker.color.r = 1.0
+        marker.color.g = 0.0
+        marker.color.b = 0.0
+        marker.lifetime = MARKER_LIFETIME
+        self.current_goal_marker_pub.publish(MarkerArray(markers=[marker]))
+        self.published_goal_index = index
+
+    def delete_current_goal_marker(self):
+        delete_marker = Marker()
+        delete_marker.header.frame_id = "map"
+        delete_marker.header.stamp = self.get_clock().now().to_msg()
+        delete_marker.ns = "current_goal"
+        delete_marker.id = 0
+        delete_marker.action = Marker.DELETE
+        self.current_goal_marker_pub.publish(MarkerArray(markers=[delete_marker]))
+        self.published_goal_index = None
+
     def main_loop(self):
         """メインループ (カスタムの到着判定ロジックを実行)"""
         self.callback_behavior_timer()
@@ -420,26 +464,10 @@ class Nav2WaypointManager(Node):
                 throttle_duration_sec=5.0)
             return
 
-        # --- 現在の目標ウェイポイントマーカーの更新 ---
-        if self.is_navigating and self.current_waypoint_index < len(self.waypoints):
-            # 新しい矢印マーカーを作成（ADDアクションで上書き更新）
-            goal_pose = self.waypoints[self.current_waypoint_index].pose
-            marker = Marker()
-            marker.header.frame_id = "map"
-            marker.header.stamp = self.get_clock().now().to_msg()
-            marker.ns = "current_goal"
-            marker.id = 0
-            marker.type = Marker.ARROW
-            marker.action = Marker.ADD
-            marker.pose = goal_pose
-            marker.scale.x = 1.5  # 矢印の長さ
-            marker.scale.y = 0.3  # 矢印の幅
-            marker.scale.z = 0.3  # 矢印の高さ
-            marker.color.a = 1.0
-            marker.color.r = 1.0
-            marker.color.g = 0.0
-            marker.color.b = 0.0
-            self.current_goal_marker_pub.publish(marker)
+        # --- 現在の目標ウェイポイントマーカーの更新 (目標が変わったときだけ publish) ---
+        if (self.is_navigating and self.current_waypoint_index < len(self.waypoints)
+                and self.published_goal_index != self.current_waypoint_index):
+            self.publish_current_goal_marker(self.current_waypoint_index)
 
         # 1. ナビゲーション中でない場合は、次のゴールを送信
         if not self.is_navigating and self.current_waypoint_index < len(self.waypoints):
@@ -539,12 +567,7 @@ class Nav2WaypointManager(Node):
                 
                 # 次のウェイポイントへ
                 # is_navigatingをFalseにする前に、マーカーを削除する
-                delete_marker = Marker()
-                delete_marker.header.frame_id = "map"
-                delete_marker.ns = "current_goal"
-                delete_marker.id = 0
-                delete_marker.action = Marker.DELETE
-                self.current_goal_marker_pub.publish(delete_marker)
+                self.delete_current_goal_marker()
 
                 self.is_navigating = False
                 self.arrival_check_count = 0
@@ -582,6 +605,7 @@ class Nav2WaypointManager(Node):
             self.last_attr_time = self.get_clock().now()
             self.current_attr_value = attr_value
             self.current_attr_type = "wait"
+            self.waiting_pub.publish(Int32(data=self.current_waypoint_index))
 
         elif attr_type == "slow":
             self.get_logger().info(f"Setting max_speed_xy to {attr_value} m/s.")
