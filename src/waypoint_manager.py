@@ -97,9 +97,12 @@ class Nav2WaypointManager(Node):
         self.stop_command_pub = self.create_publisher(Empty, '/wizurg/stop_cmd_vel', 10)
         self.start_command_pub = self.create_publisher(Empty, '/wizurg/start_cmd_vel', 10)
         self.slow_command_pub = self.create_publisher(Float32, '/wizurg/slow_cmd_vel', 10)
-        # pass_through 区間 (次のウェイポイントまで) の間、obstacle_monitor に経路付近の障害物を無視させる.
-        # レベル方式で出し続け、途絶えると obstacle_monitor 側で自動的に解除される.
-        self.pass_through_pub = self.create_publisher(Bool, '/wizurg/pass_through', 10)
+        # obstacle_monitor の検出範囲 (停止判定の範囲・不感帯・costmap 除外) を、いま走っている区間
+        # (最後に到着したウェイポイントから次まで) の属性に合わせて切り替える.
+        # 書式は "<属性>" または "<属性>;<項目>=<値>;..." (項目はウェイポイント個別の上書き, 属性の zone_<項目>).
+        # レベル方式で出し続け、途絶えると obstacle_monitor 側で normal に戻る.
+        self.zone_pub = self.create_publisher(String, '/wizurg/obstacle_zone', 10)
+        self.zone_attribute = None  # 検出範囲を決める属性 (最後に到着したウェイポイントの属性)
         self.skip_command_sub = self.create_subscription(Empty, '/skip_waypoint', self.skip_command_callback, 10)
         # wait 属性のウェイポイントで停止中に受け取ると、停止を解除して次のウェイポイントへ進む
         self.start_waypoint_sub = self.create_subscription(Empty, '/start_waypoint', self.start_waypoint_callback, 10)
@@ -115,7 +118,6 @@ class Nav2WaypointManager(Node):
         if self.current_attr_type == "wait":
             self.waiting_pub.publish(Int32(data=-1))
         if self.current_attr_type == "pass_through":
-            self.pass_through_pub.publish(Bool(data=False))
             self.get_logger().info("pass_through segment finished.")
         self.current_attr_type = "normal"
         self.current_attr_value = 0
@@ -420,8 +422,6 @@ class Nav2WaypointManager(Node):
             if time_diff.nanoseconds / 1e9 > self.current_attr_value:
                 self.reset_attribute_state()
                 self.get_logger().info("Stop duration completed. Resuming navigation.")
-        elif self.current_attr_type == "pass_through":
-            self.pass_through_pub.publish(Bool(data=True))
 
     def publish_current_goal_marker(self, index):
         marker = Marker()
@@ -453,9 +453,32 @@ class Nav2WaypointManager(Node):
         self.current_goal_marker_pub.publish(MarkerArray(markers=[delete_marker]))
         self.published_goal_index = None
 
+    # ウェイポイント個別に上書きできる検出範囲の項目 (属性のキーは zone_<項目>)
+    ZONE_FIELDS = (
+        'stop_distance', 'stop_distance_back', 'path_clearance_left', 'path_clearance_right',
+        'min_blocking_cells', 'deadband_left_ratio', 'deadband_right_ratio', 'costmap_margin',
+        'lookahead', 'lookbehind',
+    )
+
+    def zone_request(self):
+        """obstacle_monitor に送る検出範囲の指令 ("<属性>;<項目>=<値>;...")"""
+        attr = self.zone_attribute or {}
+        parts = [str(attr.get('type', 'normal'))]
+        for field in self.ZONE_FIELDS:
+            v = attr.get('zone_' + field)
+            if v is None or v == '':
+                continue
+            try:
+                parts.append(f"{field}={float(v)}")
+            except (TypeError, ValueError):
+                self.get_logger().warn(f"zone_{field} の値を読めません: {v!r}", throttle_duration_sec=10.0)
+        return ';'.join(parts)
+
     def main_loop(self):
         """メインループ (カスタムの到着判定ロジックを実行)"""
         self.callback_behavior_timer()
+        # wait で止まっている間も出し続ける (止まっている間の検出範囲もその区間の属性で決まる)
+        self.zone_pub.publish(String(data=self.zone_request()))
 
         # wait 属性で停止中は次のゴールを送らず、/start_waypoint を待つ
         if self.current_attr_type == "wait":
@@ -583,6 +606,9 @@ class Nav2WaypointManager(Node):
 
     def process_waypoint_attribute(self, attribute):
         self.reset_attribute_state()  # 前回のwaypointのattributeを解除する
+        # 次のウェイポイントに到達するまで、この属性 (と個別の上書き) で検出範囲を決める
+        self.zone_attribute = attribute
+        self.get_logger().info(f"Obstacle detection zone: {self.zone_request()}")
 
         attr_type = attribute.get("type", "normal")
         attr_value = attribute.get("value", 0)
@@ -626,7 +652,6 @@ class Nav2WaypointManager(Node):
                 msg = Float32()
                 msg.data = float(attr_value)
                 self.slow_command_pub.publish(msg)
-            self.pass_through_pub.publish(Bool(data=True))
             self.last_attr_time = self.get_clock().now()
             self.current_attr_value = attr_value
             self.current_attr_type = "pass_through"
